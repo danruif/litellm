@@ -100,42 +100,6 @@ export const compactBudgetEditorFields = (budget?: Budget | null): BudgetEditorF
   budgetDuration: budget == null ? "1mo" : budget.budget_duration ?? "",
 });
 
-type BudgetPeriod = "1mo" | "12mo";
-
-export const budgetPeriodAmount = (fields: BudgetEditorFields, duration: BudgetPeriod): string => {
-  const scalar = fields.budgetDuration === duration ? fields.maxBudget : "";
-  const amounts = [
-    scalar,
-    ...fields.budgetWindows
-      .filter((window) => window.budget.budget_duration === duration)
-      .map((window) => window.maxBudget),
-  ].filter((amount) => amount.trim() !== "");
-  return amounts.reduce(
-    (smallest, amount) => (smallest === "" || Number(amount) < Number(smallest) ? amount : smallest),
-    "",
-  );
-};
-
-export const updateBudgetPeriod = (
-  fields: BudgetEditorFields,
-  duration: BudgetPeriod,
-  amount: string,
-): BudgetEditorFields => {
-  const scalarPeriod = fields.budgetDuration === duration;
-  const hasWindow = fields.budgetWindows.some((window) => window.budget.budget_duration === duration);
-  const updatedWindows = fields.budgetWindows.map((window) =>
-    window.budget.budget_duration === duration ? { ...window, maxBudget: amount } : window,
-  );
-  return {
-    ...fields,
-    ...(scalarPeriod ? { maxBudget: amount } : {}),
-    budgetWindows:
-      scalarPeriod || hasWindow || !amount.trim()
-        ? updatedWindows
-        : [...updatedWindows, { budget: { budget_duration: duration, max_budget: 0 }, maxBudget: amount }],
-  };
-};
-
 export const compactBudgetEditorValue = (fields: BudgetEditorFields, original?: Budget | null) =>
   budgetEditorValue(
     { ...fields, budgetWindows: fields.budgetWindows.filter((window) => window.maxBudget.trim() !== "") },
@@ -162,6 +126,16 @@ export function budgetChanges(value: Budget, initial?: Budget | null): Budget {
     ...(changed.max_budget != null ? { budget_duration: value.budget_duration } : {}),
   };
 }
+
+export const budgetPolicyChanges = (policy: Budget | null | undefined, original: Budget | null | undefined): Budget =>
+  budgetChanges(
+    {
+      model_tpm_limit: policy?.model_tpm_limit ?? null,
+      model_rpm_limit: policy?.model_rpm_limit ?? null,
+      cap_policy: policy?.cap_policy ?? null,
+    },
+    original,
+  );
 
 interface BudgetAssignment {
   budget?: Budget | null;

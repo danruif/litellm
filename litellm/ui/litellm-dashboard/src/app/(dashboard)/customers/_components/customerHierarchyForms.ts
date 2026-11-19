@@ -2,13 +2,12 @@ import type { components } from "@/lib/http/schema";
 
 import {
   budgetEditorFields,
-  budgetChanges,
   compactBudgetEditorFields,
-  compactBudgetEditorValue,
   customerBaseBudget,
   customerBudgetPatch,
   hasLegacyCustomerBudget,
   parseBudget,
+  permanentBudgetEditorValue,
   type Budget,
   type BudgetEditorFields,
 } from "./customerBudgetForm";
@@ -80,10 +79,6 @@ export const customerHierarchyFields = (
     entity.kind === "member" &&
     !hasLegacyCustomerBudget(entity.record) &&
     organization?.default_budgets.some((preset) => preset.budget_id === entity.record.budget_id);
-  const monthly =
-    entity.kind === "organization"
-      ? storedBudget?.budget_limits?.find((window) => window.budget_duration === "1mo")
-      : undefined;
   const privateMember =
     entity.kind === "member" &&
     organization != null &&
@@ -92,7 +87,6 @@ export const customerHierarchyFields = (
     alias: entity.record.alias ?? "",
     ...(entity.kind === "member" ? compactBudgetEditorFields(storedBudget) : budgetEditorFields(storedBudget)),
     ...(entity.kind === "member" ? { budgetEnabled: !memberPreset } : {}),
-    ...(monthly ? { maxBudget: String(monthly.max_budget) } : {}),
     templateId: entity.kind === "team" || privateMember ? "" : entity.record.budget_id ?? "",
   };
 };
@@ -142,20 +136,6 @@ const memberPatch = (
   return { ok: true, patch: { kind: "member", body } };
 };
 
-const organizationBudget = (original: Budget | null | undefined, parsed: Budget): Budget => {
-  const windows = original?.budget_limits;
-  return {
-    ...original,
-    ...parsed,
-    max_budget: windows?.some((window) => window.budget_duration === "1mo") ? original?.max_budget : parsed.max_budget,
-    budget_limits:
-      windows?.flatMap((window) => {
-        if (window.budget_duration !== "1mo") return [window];
-        return parsed.max_budget != null ? [{ ...window, max_budget: parsed.max_budget }] : [];
-      }) ?? windows,
-  };
-};
-
 export const buildCustomerHierarchyPatch = (
   entity: CustomerHierarchyEntity,
   fields: CustomerHierarchyFields,
@@ -170,22 +150,15 @@ export const buildCustomerHierarchyPatch = (
   }
   const changed = budgetChanged(fields, initial) || groupChanged;
   const original = entity.record.budget;
-  const parsed = compactBudgetEditorValue({ ...fields, budgetEnabled: fields.budgetEnabled && changed }, original);
+  const parsed = permanentBudgetEditorValue({ ...fields, budgetEnabled: fields.budgetEnabled && changed }, original);
   if (!parsed.ok) return { ok: false, error: "invalidNumber" };
-  const budget =
-    parsed.value && entity.kind === "organization" ? organizationBudget(original, parsed.value) : parsed.value;
-  const baseline = compactBudgetEditorValue(initial, original);
-  const previous =
-    baseline.ok && baseline.value && entity.kind === "organization"
-      ? organizationBudget(original, baseline.value)
-      : original;
   return {
     ok: true,
     patch: {
       kind: entity.kind,
       body: {
         ...aliasPatch,
-        ...(changed ? { budget: budget && budgetChanges(budget, previous) } : {}),
+        ...(changed ? { budget: parsed.value } : {}),
       },
     },
   };
