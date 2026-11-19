@@ -11,6 +11,7 @@ export interface CustomerBudgetGroupFields {
   tpm: string;
   rpm: string;
   capPolicy: CustomerCapPolicy;
+  allowedModels?: readonly string[];
 }
 
 export interface CustomerOrganizationFields {
@@ -81,6 +82,10 @@ export const limit = (value: string, duration: "1mo" | "12mo") => {
   return amount === null ? [] : [{ budget_duration: duration, max_budget: amount }];
 };
 
+export const normalizeGroupModels = (models: readonly string[] = []): string[] => [
+  ...new Set(models.map((model) => model.trim()).filter(Boolean)),
+];
+
 export type CustomerOrganizationFormError =
   | "nameRequired"
   | "groupNameRequired"
@@ -108,6 +113,7 @@ export function validateCustomerBudgetGroups(
     fields.groups.some(
       (group) =>
         !existingGroupIds.includes(group.id) &&
+        !normalizeGroupModels(group.allowedModels).length &&
         [group.monthlyBudget, group.yearlyBudget, group.tpm, group.rpm].every((value) => !value.trim()),
     )
   ) {
@@ -157,6 +163,9 @@ export function buildCustomerOrganizationBody(fields: CustomerOrganizationFields
       budget_limits: [...limit(group.monthlyBudget, "1mo"), ...limit(group.yearlyBudget, "12mo")],
       ...(group.tpm.trim() ? { tpm_limit: Number(group.tpm) } : {}),
       ...(group.rpm.trim() ? { rpm_limit: Number(group.rpm) } : {}),
+      ...(normalizeGroupModels(group.allowedModels).length
+        ? { allowed_models: normalizeGroupModels(group.allowedModels) }
+        : {}),
     })),
     default_budget_template: fields.groups.find((group) => group.id === fields.defaultGroupId)?.name.trim(),
   } satisfies components["schemas"]["OrganizationCreate"];
