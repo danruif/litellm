@@ -13,7 +13,10 @@ use litellm_redis_store::{
 use litellm_repositories::KeyRepository;
 
 use crate::{
-    Error, Gateway, RedisClients, Resources, db, keys::StoredKeys, license::build_license,
+    Error, Gateway, RedisClients, Resources, db,
+    keys::StoredKeys,
+    license::build_license,
+    middleware::rate_limit::{self, RateLimit},
 };
 
 #[derive(Clone)]
@@ -24,6 +27,8 @@ pub struct AppState {
     /// The virtual keys of the proxy's database. `None` without a database.
     pub keys: Option<Arc<dyn KeyLookup>>,
     pub entitlements: Arc<Entitlements>,
+    /// The proxy's `parallel_request_limiter_v3`, over the coordination Redis.
+    pub rate_limit: Arc<RateLimit>,
     /// The config's `environment_variables` in front of the process environment.
     pub environment: Arc<dyn Lookup + Send + Sync>,
 }
@@ -39,8 +44,12 @@ impl AppState {
         environment: &Environment,
         resources: &Resources,
     ) -> Result<Self, Error> {
-        let inference = crate::build_inference(config, resources).await?;
         let redis = crate::redis::connect(config, resources).await?;
+        let usage_redis = redis.coordination.clone().map(|client| Remote {
+            client,
+            default_ttl: rate_limit::REDIS_DEFAULT_TTL,
+        });
+        let inference = crate::build_inference(config, resources, usage_redis).await?;
         let (database, keys) = db::connect(config, &resources.secrets)
             .await?
             .map(|(pools, repositories)| {
@@ -52,12 +61,18 @@ impl AppState {
             })
             .unzip();
         let entitlements = Arc::new(build_license(config, environment, resources).await);
+        let rate_limit = Arc::new(RateLimit::new(
+            rate_limit::Settings::read(config, environment),
+            redis.coordination.clone(),
+            inference.clone(),
+        ));
         Ok(Self {
             inference,
             redis,
             database,
             keys,
             entitlements,
+            rate_limit,
             environment: resources.environment.clone(),
         })
     }

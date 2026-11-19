@@ -16,7 +16,9 @@ use litellm_host_http::Sse;
 use litellm_inference_messages::{
     MessagesBody, MessagesCall, MessagesRoute, MessagesShaping, messages_body, route::Messages,
 };
-use litellm_llms_types::formats::messages::MessagesOptionalParams;
+use litellm_llms_types::formats::messages::{
+    MessagesOptionalParams, streaming::MessagesStreamUsage,
+};
 use litellm_llms_types::headers::{ProviderSpecificHeader, ProviderSpecificHeaders};
 use litellm_router_core::{Attempt, Deployment, Op, Served};
 use serde_json::{Map, Value};
@@ -28,8 +30,9 @@ use crate::{
     model_restamp::{ReportedModel, Stamp},
     request,
     routing::{self, Host, RouteAttempt, RouteChunks},
-    stream_event::{self, Read},
-    stream_outcome::{self, Streamed},
+    stream_event::{self, Counts, Read},
+    stream_outcome::{self, Outcome, Streamed},
+    usage::{ServedUsage, UsageSink},
 };
 
 /// Client headers Python forwards to Anthropic-speaking providers on every call.
@@ -47,10 +50,12 @@ pub async fn create<H: Host>(
     identity: AuthenticatedRequest,
     RequestId(request_id): RequestId,
     headers: HeaderMap,
+    sink: Option<Extension<UsageSink>>,
     body: Result<JsonObject, Error>,
 ) -> impl IntoResponse {
+    let sink = sink.map(|Extension(sink)| sink);
     let result = match body {
-        Ok(JsonObject(body)) => handle(&gateway, &identity, &headers, body).await,
+        Ok(JsonObject(body)) => handle(&gateway, &identity, &headers, sink, body).await,
         Err(error) => Err(error.into()),
     };
     result.map_err(|ended| {
@@ -66,6 +71,7 @@ async fn handle<H: Host>(
     gateway: &Gateway<H>,
     identity: &AuthenticatedRequest,
     headers: &HeaderMap,
+    sink: Option<UsageSink>,
     body: Map<String, Value>,
 ) -> Result<Response, Ended> {
     let model = request::model(&body)?.to_owned();
@@ -96,12 +102,64 @@ async fn handle<H: Host>(
     .await?;
     let routing = Routing::served(&routed);
     let reported = ReportedModel::of(&model, &routed);
+    let model_group = routed.name.clone();
     let (ran, cache) = routed.output.response;
+    let ran = match sink {
+        Some(sink) => told(ran, sink, model.clone(), model_group),
+        None => ran,
+    };
     let stream =
         Sse::<Messages, _, _>::new(Json, |error| Bytes::from(Error::from(error).sse_frame()));
     let ran = reported.stream(reported.complete(ran), message_start);
     let response = litellm_host_http::render(stream, stream_outcome::bytes(ran))?;
     Ok((Extension(routing), cache.apply(response)).into_response())
+}
+
+/// What a complete answer's `usage` counts.
+fn complete_counts(body: &MessagesBody) -> Option<Counts> {
+    let usage = match body {
+        MessagesBody::Message(message) => message.usage.as_ref(),
+        MessagesBody::Unchecked(fields) => fields.get("usage"),
+    }?;
+    serde_json::from_value::<MessagesStreamUsage>(usage.clone())
+        .ok()
+        .map(Counts::from)
+}
+
+/// `ran`, with `sink` told what it used: a complete answer now, a stream once it ends.
+fn told(
+    ran: Streamed<Messages>,
+    sink: UsageSink,
+    model: String,
+    model_group: String,
+) -> Streamed<Messages> {
+    let served = move |counts: Counts| ServedUsage {
+        model: model.clone(),
+        model_group: model_group.clone(),
+        usage: counts.usage(),
+    };
+    match ran {
+        CallOutput::Complete(body) => {
+            if let Some(counts) = complete_counts(&body) {
+                sink.tell(served(counts));
+            }
+            CallOutput::Complete(body)
+        }
+        CallOutput::Stream { head, chunks } => CallOutput::Stream {
+            head,
+            chunks: stream_outcome::watched(
+                chunks,
+                stream_event::messages_event,
+                stream_outcome::broke,
+                move |outcome: Outcome| {
+                    if let Ok(counts) = outcome {
+                        sink.tell(served(counts));
+                    }
+                    async {}
+                },
+            ),
+        },
+    }
 }
 
 /// Where a Messages stream names its model: the `message_start` event, the first one that is

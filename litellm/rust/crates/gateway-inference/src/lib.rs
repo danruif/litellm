@@ -4,20 +4,25 @@
 //! routes a public model name through `litellm-router-core` (pick, retries, fallbacks, cooldowns)
 //! and runs the core route on each attempt.
 
+mod asked;
 mod audio_transcription;
 mod caching;
 mod chat_completions;
 mod error;
+mod group_usage;
 mod headers;
 pub mod messages;
 mod model_restamp;
 mod ocr;
+mod rate_limited;
 mod request;
 mod responses;
 pub mod routing;
+mod routing_cache;
 mod stream_event;
 mod stream_hold;
 mod stream_outcome;
+mod usage;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -32,17 +37,21 @@ use litellm_inference_transcription::AudioTranscriptionRoute;
 use litellm_llms::base_llm::ocr::{handler::OcrClient, settings::OcrSettings};
 use litellm_secrets::source::SecretSource;
 
+pub use asked::{AskedModels, ModelAsked, RESPONSES_CALL_TYPE, call_type};
 pub use error::{BodyError, Ended, Error};
 pub use headers::ExposedHeader;
+pub use rate_limited::{RateLimited, Refused};
 pub use request::{JsonObject, MAX_BODY_BYTES, RequestId};
 pub use routing::Host;
+pub use routing_cache::RoutingCache;
+pub use usage::{ServedUsage, UsageSink};
 
 pub struct Gateway<H> {
     host: H,
     cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
     client_side_credentials: bool,
-    /// Cooldowns, allowed-fails counters and per-minute usage of the deployments, in this process.
-    routing: Arc<litellm_router_core::InMemoryRouterCache>,
+    /// Cooldowns, allowed-fails counters and per-minute usage of the deployments.
+    routing: Arc<RoutingCache>,
     /// How the chat and messages routes shape a call to each deployment, by deployment id.
     shaping: HashMap<String, MessagesShaping>,
     pub audio_transcription: AudioTranscriptionRoute,
@@ -71,9 +80,17 @@ impl<H: Host> Gateway<H> {
         }
     }
 
+    /// Count the deployments' per-minute usage in `remote`, where Python's router counts it too.
+    pub fn with_usage_redis(self, remote: litellm_redis_store::Remote) -> Self {
+        Self {
+            routing: Arc::new(RoutingCache::new(Some(remote))),
+            ..self
+        }
+    }
+
     /// Cooldowns, allowed-fails counters and per-minute usage of the deployments, which the host
     /// hands router-core.
-    pub fn routing(&self) -> &litellm_router_core::InMemoryRouterCache {
+    pub fn routing(&self) -> &RoutingCache {
         &self.routing
     }
 
@@ -153,6 +170,10 @@ pub fn router<H: Host>(gateway: Arc<Gateway<H>>) -> Router {
             request::MAX_BODY_BYTES,
         ))
         .layer(headers::layer())
+        .layer(axum::middleware::from_fn_with_state(
+            gateway.clone(),
+            group_usage::told::<H>,
+        ))
         .with_state(gateway)
 }
 

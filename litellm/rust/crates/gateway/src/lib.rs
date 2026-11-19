@@ -30,6 +30,7 @@ use litellm_http::{
     media::PublicDnsResolver,
 };
 use litellm_model_catalog::{BUNDLED_REGISTRY, Catalog};
+use litellm_redis_store::Remote;
 use litellm_secrets::{OidcResolver, SecretManagerState, SecretResolver};
 
 /// The config at `path`, its `os.environ/` references read from the process environment.
@@ -53,23 +54,28 @@ pub(crate) fn environment_secrets(
     )
 }
 
+/// The inference routes of `config`, counting the deployments' usage in `usage_redis` when
+/// there is one.
 pub async fn build_inference(
     config: &Config,
     resources: &Resources,
+    usage_redis: Option<Remote>,
 ) -> Result<Arc<Gateway>, Error> {
     let catalog = Catalog::parse(BUNDLED_REGISTRY)?.value;
     let (router, shaping) = boot::router(config, &catalog).await?;
-    Ok(Arc::new(
-        Gateway::new(
-            resources.core.clone(),
-            resources.http.clone(),
-            resources.secrets.clone(),
-            router,
-            shaping,
-            host::NativeHost,
-        )?
-        .with_client_side_credentials(config.general_settings.allow_client_side_credentials),
-    ))
+    let gateway = Gateway::new(
+        resources.core.clone(),
+        resources.http.clone(),
+        resources.secrets.clone(),
+        router,
+        shaping,
+        host::NativeHost,
+    )?
+    .with_client_side_credentials(config.general_settings.allow_client_side_credentials);
+    Ok(Arc::new(match usage_redis {
+        Some(remote) => gateway.with_usage_redis(remote),
+        None => gateway,
+    }))
 }
 
 pub fn install_crypto_provider() {
@@ -79,11 +85,13 @@ pub fn install_crypto_provider() {
 }
 
 pub fn router(state: AppState, config: &Config) -> Router {
-    let inference = litellm_gateway_inference::router(state.inference.clone()).route_layer(
-        axum::middleware::from_fn_with_state(
-            state.auth(config),
-            litellm_gateway_auth::authenticate,
-        ),
-    );
+    let inference = middleware::rate_limited(
+        litellm_gateway_inference::router(state.inference.clone()),
+        state.rate_limit.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
+        state.auth(config),
+        litellm_gateway_auth::authenticate,
+    ));
     middleware::inference(inference).merge(health::router(state))
 }

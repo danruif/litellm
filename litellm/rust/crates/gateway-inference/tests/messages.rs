@@ -612,3 +612,79 @@ async fn openrouter_receives_native_messages_headers_and_its_deployment_bearer(
     assert_eq!(requests.len(), 1);
     assert!(!requests[0].headers.contains_key("x-api-key"));
 }
+
+const CACHED_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":13}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+async fn told(
+    streaming: bool,
+    read_to_the_end: bool,
+) -> Vec<litellm_gateway_inference::ServedUsage> {
+    let upstream = MockServer::start().await;
+    let template = if streaming {
+        ResponseTemplate::new(200).set_body_raw(CACHED_SSE, "text/event-stream")
+    } else {
+        ResponseTemplate::new(200).set_body_json(json!({"id": "msg_test", "type": "message",
+            "role": "assistant", "model": "test-model", "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 8, "output_tokens": 13,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}}))
+    };
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .mount(&upstream)
+        .await;
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = heard.clone();
+    let request = Request::post("/v1/messages")
+        .header("content-type", "application/json")
+        .extension(litellm_gateway_inference::UsageSink::new(move |usage| {
+            sink.lock().unwrap().push(usage)
+        }))
+        .body(Body::from(
+            json!({"model": "public/model", "max_tokens": 16, "stream": streaming,
+                "messages": [{"role": "user", "content": "hi"}]})
+            .to_string(),
+        ))
+        .unwrap();
+    let response = support::app("anthropic/test-model", &upstream.uri())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    if read_to_the_end {
+        to_bytes(response.into_body(), 65536).await.unwrap();
+    }
+    heard.lock().unwrap().clone()
+}
+
+/// What the route tells is Python's litellm `Usage` of the answer: the cache tokens folded into
+/// the prompt tokens and the reads named as cached, which the rate limiter charges less.
+#[rstest]
+#[case::complete(false)]
+#[case::streamed(true)]
+#[tokio::test]
+async fn a_served_call_tells_the_sink_its_usage_with_the_cache_tokens_folded_in(
+    #[case] streaming: bool,
+) {
+    assert_eq!(
+        told(streaming, true).await,
+        [litellm_gateway_inference::ServedUsage {
+            model: "public/model".into(),
+            model_group: "public/model".into(),
+            usage: litellm_core_utils::core_helpers::usage_from_parts(8, 13, 100, 5),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_stream_the_client_drops_before_its_end_tells_nothing() {
+    assert_eq!(told(true, false).await, []);
+}

@@ -3,7 +3,9 @@
 //! `stream_outcome` for the tokens and the failure it tells the router, `stream_hold` for whether
 //! the stream has begun to answer.
 
+use litellm_core_utils::core_helpers::usage_from_parts;
 use litellm_llms_types::formats::{
+    chat_completions::ChatCompletionsUsage,
     messages::streaming::{MessagesStreamEvent, MessagesStreamUsage},
     responses::streaming::ResponsesEventType,
 };
@@ -18,6 +20,8 @@ pub struct Counts {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 impl Counts {
@@ -27,7 +31,24 @@ impl Counts {
             input_tokens: self.input_tokens.or(earlier.input_tokens),
             output_tokens: self.output_tokens.or(earlier.output_tokens),
             total_tokens: self.total_tokens.or(earlier.total_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .or(earlier.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .or(earlier.cache_read_input_tokens),
         }
+    }
+
+    /// The counts as Python's litellm `Usage` holds a Messages answer's: the cache tokens folded
+    /// into `prompt_tokens`, the reads also named as `cached_tokens`.
+    pub(crate) fn usage(self) -> ChatCompletionsUsage {
+        usage_from_parts(
+            self.input_tokens.unwrap_or(0),
+            self.output_tokens.unwrap_or(0),
+            self.cache_read_input_tokens.unwrap_or(0),
+            self.cache_creation_input_tokens.unwrap_or(0),
+        )
     }
 
     /// `total_tokens`, else the input plus the output, as [`crate::routing::total_tokens`]
@@ -44,6 +65,8 @@ impl From<MessagesStreamUsage> for Counts {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             total_tokens: None,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
         }
     }
 }

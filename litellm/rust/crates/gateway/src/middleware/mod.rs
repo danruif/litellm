@@ -9,6 +9,7 @@ pub mod cors;
 pub mod decompression;
 mod in_flight;
 mod panic;
+pub mod rate_limit;
 mod request_log;
 pub mod root_path;
 pub mod security_headers;
@@ -72,6 +73,12 @@ pub fn global(
                 decompression::decompress,
             )),
     )
+}
+
+/// A key's own limits, as a route layer the caller's authentication wraps, so it runs only for a
+/// matched route and after the caller is known.
+pub(crate) fn rate_limited(router: Router, rate_limit: Arc<rate_limit::RateLimit>) -> Router {
+    router.route_layer(from_fn_with_state(rate_limit, rate_limit::limit))
 }
 
 /// Request logging skips UI routes because their bodies carry credentials, and Python resolves the
