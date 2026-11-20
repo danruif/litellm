@@ -37,6 +37,7 @@ _SECRET_COLUMNS: Final = (
     _SecretColumn("LiteLLM_MCPServerTable", "server_id", "env"),
     _SecretColumn("LiteLLM_MCPServerOAuthClient", "server_id", "credentials"),
     _SecretColumn("LiteLLM_MCPUserCredentials", "id", "credential_b64", is_json=False),
+    _SecretColumn("LiteLLM_UserProviderCredentials", "id", "credential_b64", is_json=False),
     _SecretColumn("LiteLLM_MCPUserEnvVars", "id", "values_b64", is_json=False),
     _SecretColumn("LiteLLM_SSOIdentityAssertion", "user_id", "assertion_b64", is_json=False),
     _SecretColumn("LiteLLM_SearchToolsTable", "search_tool_id", "litellm_params"),
@@ -49,6 +50,7 @@ _SECRET_COLUMNS: Final = (
 
 _STORED_VALUE: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
 _PRIMARY_KEY: Final = TypeAdapter(str)
+_CIPHERTEXT: Final = TypeAdapter(str)
 
 ReplaceCiphertext = Callable[[str], str | None]
 
@@ -77,7 +79,9 @@ async def count_values_encrypted_with(database: SupportsRawQueries, signing_key:
 
     return sum(
         [
-            replace_ciphertexts(_STORED_VALUE.validate_python(row[secret_column.column]), keep)[1]
+            _replace_column_ciphertexts(secret_column, _STORED_VALUE.validate_python(row[secret_column.column]), keep)[
+                1
+            ]
             for secret_column in await _secret_columns_in(database)
             for row in await _rows_of(database, secret_column)
         ]
@@ -93,21 +97,20 @@ async def count_values_encrypted_with_or_none(
         return None
 
 
-async def reencrypt_stored_values(database: SupportsRawQueries, *, from_key: str, to_key: str) -> int:
+async def reencrypt_stored_values(
+    database: SupportsRawQueries, *, from_key: str, to_key: str, require_unchanged: bool = False
+) -> int:
     def reencrypted(value: str) -> str | None:
         plaintext: Final = decrypt_if_encrypted_with(value, from_key)
         return None if plaintext is None else _CIPHERTEXT.validate_python(encrypt_value_helper(plaintext, to_key))
 
     return sum(
         [
-            await _reencrypt_row(database, secret_column, row, reencrypted)
+            await _reencrypt_row(database, secret_column, row, reencrypted, require_unchanged=require_unchanged)
             for secret_column in await _secret_columns_in(database)
             for row in await _rows_of(database, secret_column)
         ]
     )
-
-
-_CIPHERTEXT: Final = TypeAdapter(str)
 
 
 async def _secret_columns_in(database: SupportsRawQueries) -> tuple[_SecretColumn, ...]:
@@ -142,9 +145,11 @@ async def _reencrypt_row(
     secret_column: _SecretColumn,
     row: Mapping[str, object],
     reencrypted: ReplaceCiphertext,
+    *,
+    require_unchanged: bool = False,
 ) -> int:
     stored: Final = _STORED_VALUE.validate_python(row[secret_column.column])
-    migrated, count = replace_ciphertexts(stored, reencrypted)
+    migrated, count = _replace_column_ciphertexts(secret_column, stored, reencrypted)
     if count == 0:
         return 0
     cast_to: Final = "::jsonb" if secret_column.is_json else ""
@@ -155,7 +160,22 @@ async def _reencrypt_row(
         _PRIMARY_KEY.validate_python(row[secret_column.primary_key]),
         _as_sql_parameter(stored, secret_column),
     )
+    if require_unchanged and not rows_updated:
+        raise RuntimeError("Stored secrets changed during master key rotation. Retry with writes paused.")
     return count if rows_updated else 0
+
+
+def _replace_column_ciphertexts(
+    column: _SecretColumn, stored: JsonValue, replacement_for: ReplaceCiphertext
+) -> tuple[JsonValue, int]:
+    if column.is_json and isinstance(stored, str) and stored.lstrip().startswith(("{", "[")):
+        try:
+            parsed: Final = _STORED_VALUE.validate_json(stored)
+        except ValueError:
+            return stored, 0
+        replaced, count = replace_ciphertexts(parsed, replacement_for)
+        return (json.dumps(replaced), count) if count else (stored, 0)
+    return replace_ciphertexts(stored, replacement_for)
 
 
 def _as_sql_parameter(value: JsonValue, secret_column: _SecretColumn) -> str:

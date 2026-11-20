@@ -264,8 +264,9 @@ async def test_schema_without_some_of_the_tables_is_migrated_for_the_tables_it_h
 class _SomeoneEditsEachRowAfterItIsRead(_FakeDatabase):
     async def query_raw(self, query: str, *args: object) -> Sequence[Mapping[str, object]]:
         rows = await super().query_raw(query, *args)
-        for row in self.tables.get("LiteLLM_MCPUserCredentials", []):
-            row["credential_b64"] = "edited-by-an-admin"
+        if 'FROM "LiteLLM_MCPUserCredentials"' in query:
+            for row in self.tables.get("LiteLLM_MCPUserCredentials", []):
+                row["credential_b64"] = "edited-by-an-admin"
         return rows
 
 
@@ -279,6 +280,40 @@ async def test_value_edited_while_the_migration_runs_is_not_overwritten():
 
     assert migrated == 0
     assert tables["LiteLLM_MCPUserCredentials"][0]["credential_b64"] == "edited-by-an-admin"
+
+
+@pytest.mark.asyncio
+async def test_rotation_reports_a_concurrent_edit_without_overwriting_it() -> None:
+    tables: Tables = {"LiteLLM_MCPUserCredentials": [{"id": "cred-row-1", "credential_b64": _encrypted("byok-secret")}]}
+
+    with pytest.raises(RuntimeError, match="Stored secrets changed"):
+        await reencrypt_stored_values(
+            _SomeoneEditsEachRowAfterItIsRead(tables), from_key=PREVIOUS_KEY, to_key=NEW_KEY, require_unchanged=True
+        )
+
+    assert tables["LiteLLM_MCPUserCredentials"][0]["credential_b64"] == "edited-by-an-admin"
+
+
+@pytest.mark.asyncio
+async def test_rotation_preserves_json_string_wrappers_and_malformed_json() -> None:
+    malformed = '{"secret":'
+    foreign = _encrypted("foreign", UNRELATED_KEY)
+    tables: Tables = {
+        "LiteLLM_Config": [
+            {"param_name": "wrapped", "param_value": json.dumps([_encrypted("stored"), malformed, foreign])},
+            {"param_name": "malformed", "param_value": malformed},
+        ]
+    }
+    database = _FakeDatabase(tables)
+
+    migrated = await reencrypt_stored_values(database, from_key=PREVIOUS_KEY, to_key=NEW_KEY, require_unchanged=True)
+
+    assert migrated == 1
+    stored, unchanged_malformed, unchanged_foreign = json.loads(str(tables["LiteLLM_Config"][0]["param_value"]))
+    assert decrypt_if_encrypted_with(stored, NEW_KEY) == "stored"
+    assert decrypt_if_encrypted_with(stored, PREVIOUS_KEY) is None
+    assert (unchanged_malformed, unchanged_foreign) == (malformed, foreign)
+    assert tables["LiteLLM_Config"][1]["param_value"] == malformed
 
 
 def test_replacing_ciphertexts_keeps_structure_markers_and_non_strings():
