@@ -3900,7 +3900,6 @@ async def customer_accounting_counters(
     from litellm.proxy.auth.customer_hierarchy_auth import (
         get_customer_scopes_for_accounting,
     )
-    from litellm.proxy.management_helpers.customer_hierarchy import utc_datetime
 
     try:
         scopes: Final = (
@@ -3917,10 +3916,10 @@ async def customer_accounting_counters(
             "Unable to load customer budget windows for spend accounting"
         )
         return ()
-    now: Final = utc_datetime(started_at) if started_at is not None else datetime.now(timezone.utc)
+    now: Final = started_at.astimezone(timezone.utc) if started_at is not None else datetime.now(timezone.utc)
     return tuple(
         chain.from_iterable(
-            customer_window_counters(scope.key, scope.entity_id, scope.budget_limits, now=now) for scope in scopes
+            customer_window_counters(scope.key, scope.entity_id, scope.accounting_limits(), now=now) for scope in scopes
         )
     )
 
@@ -3954,6 +3953,7 @@ async def accounting_window_keys(
             "entity_id": counter.entity_id,
             "window_duration": counter.window_duration,
             "window_start": counter.window_start.isoformat(),
+            **({"reset_at": counter.reset_at.isoformat()} if counter.reset_at is not None else {}),
         }
         for counter in customer_counters
         if counter.window_start is not None
@@ -4577,6 +4577,7 @@ async def _enqueue_window_spend_row_update(
                 window_start=window_start,
                 spend=increment,
                 started_at=request_started_at,
+                reset_at=reset_at,
             )
         )
     except Exception as e:  # noqa: BLE001  # spend tracking must never fail the cost callback
